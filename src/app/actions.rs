@@ -1,5 +1,7 @@
+use crate::api::video::VideoPage;
 use crate::app::{App, PreviousPage};
 use crate::application::{AppAction, network};
+use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
 use crate::infrastructure::{media, persistence};
 use crate::presentation::tui::{
     BangumiDetailPage, BangumiPage, DynamicDetailPage, DynamicPage, FavoritesPage, HistoryPage,
@@ -7,6 +9,21 @@ use crate::presentation::tui::{
     UpPage,
 };
 use std::sync::Arc;
+
+fn multipart_playlist_items(bvid: &str, aid: i64, pages: Vec<VideoPage>) -> Vec<PlaylistItem> {
+    pages
+        .into_iter()
+        .map(|page| PlaylistItem {
+            bvid: bvid.to_string(),
+            aid,
+            cid: Some(page.cid),
+            title: page.part,
+            uploader_mid: None,
+            duration: Some(page.duration),
+            page: Some(page.page),
+        })
+        .collect()
+}
 
 impl App {
     fn login_required_message() -> String {
@@ -137,42 +154,22 @@ impl App {
                 pages,
                 current_index,
             } => {
-                // Play only the selected episode
-                if current_index < pages.len() {
-                    let session_id = self.allocate_playback_session();
-                    self.playback.session_id = None;
-                    self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
-                    let page = &pages[current_index];
-                    let api_client = self.api_client.clone();
-                    match media::play_video(
-                        api_client,
-                        &bvid,
-                        aid,
-                        page.cid,
-                        page.duration,
-                        Some(page.page),
-                        self.credentials.as_ref(),
-                        self.config.danmaku.clone(),
-                        self.playback_event_tx.clone(),
-                        session_id,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            self.playback.begin_session(session_id);
-                        }
-                        Err(error) => {
-                            self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                            self.playback.last_error = Some(format!("启动播放器失败: {error:#}"));
-                        }
-                    }
-                    // Update current page index in video detail page
-                    if let Page::VideoDetail(detail_page) = &mut self.current_page
-                        && detail_page.bvid == bvid
-                    {
-                        detail_page.current_page_index = current_index;
-                    }
+                if current_index >= pages.len() {
+                    return;
                 }
+                if let Page::VideoDetail(detail_page) = &mut self.current_page
+                    && detail_page.bvid == bvid
+                {
+                    detail_page.current_page_index = current_index;
+                }
+                let items = multipart_playlist_items(&bvid, aid, pages);
+                self.start_playlist(
+                    items,
+                    PlaylistSource::Manual,
+                    current_index,
+                    PlayOrder::Forward,
+                )
+                .await;
             }
             AppAction::PlayPlaylist {
                 items,
@@ -1147,5 +1144,37 @@ impl App {
     fn save_theme_to_config(&mut self) {
         self.config.theme = self.theme_id.clone();
         if persistence::save_config(&self.config).is_err() {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multipart_pages_become_an_ordered_playlist() {
+        let items = multipart_playlist_items(
+            "BV1test",
+            42,
+            vec![
+                VideoPage {
+                    cid: 101,
+                    page: 1,
+                    part: "第一集".into(),
+                    duration: 60,
+                },
+                VideoPage {
+                    cid: 102,
+                    page: 2,
+                    part: "第二集".into(),
+                    duration: 90,
+                },
+            ],
+        );
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].cid, Some(101));
+        assert_eq!(items[1].page, Some(2));
+        assert_eq!(items[1].title, "第二集");
     }
 }

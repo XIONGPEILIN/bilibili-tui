@@ -23,6 +23,20 @@ static LIVE_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MPV_IPC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const LIVE_DANMAKU_SCRIPT: &str = include_str!("live_danmaku.lua");
 
+fn configure_vod_buffering(cmd: &mut Command) {
+    // 用户配置可能全局启用了 low-latency；这些选项会让分离的 DASH
+    // 视频流只能保留极小的可跳转范围，因此 VOD 播放需要显式恢复默认值。
+    cmd.arg("--audio-buffer=0.2");
+    cmd.arg("--vd-lavc-threads=0");
+    cmd.arg("--cache=yes");
+    cmd.arg("--cache-pause=yes");
+    cmd.arg("--demuxer-lavf-o=");
+    cmd.arg("--demuxer-lavf-probe-info=auto");
+    cmd.arg("--demuxer-lavf-analyzeduration=0");
+    cmd.arg("--video-latency-hacks=no");
+    cmd.arg("--stream-buffer-size=128KiB");
+}
+
 /// Play a video using mpv with yt-dlp and report watch progress
 /// This function spawns mpv in a background task to avoid blocking the TUI
 #[allow(clippy::too_many_arguments)]
@@ -84,7 +98,7 @@ pub async fn play_video(
 
     cmd.arg("--force-window=immediate");
     // Use MPV's low-latency profile for Bilibili VOD playback.
-    cmd.arg("--profile=low-latency");
+    configure_vod_buffering(&mut cmd);
     // The TUI owns VOD danmaku rendering through the same OSD script used by
     // live playback. Do not pass CID to global MPV scripts, which would add a
     // second ASS subtitle track.
@@ -453,19 +467,43 @@ fn ensure_mpv_success(value: &serde_json::Value) -> Result<()> {
     }
 }
 
+fn playlist_load_options(
+    item: Option<&PlaylistItem>,
+    audio_url: &str,
+    position: f64,
+) -> Result<String> {
+    if audio_url.contains(',') {
+        anyhow::bail!("audio CDN URL cannot be represented as an MPV option list");
+    }
+    let mut options = vec![
+        format!("audio-files={audio_url}"),
+        format!("start={position}"),
+    ];
+    if let Some(item) = item {
+        let page_url = match item.page {
+            Some(page) if page > 1 => {
+                format!("https://www.bilibili.com/video/{}?p={page}", item.bvid)
+            }
+            _ => format!("https://www.bilibili.com/video/{}", item.bvid),
+        };
+        let title = item.title.replace([',', '\n', '\r'], " ");
+        options.push(format!("referrer={page_url}"));
+        options.push(format!("force-media-title={title}"));
+    }
+    Ok(options.join(","))
+}
+
 async fn loadfile_and_wait(
     path: &std::path::Path,
+    item: Option<&PlaylistItem>,
     video_url: &str,
     audio_url: &str,
     position: f64,
 ) -> Result<()> {
     timeout(Duration::from_secs(10), async {
-        if audio_url.contains(',') {
-            anyhow::bail!("audio CDN URL cannot be represented as an MPV option list");
-        }
         let mut stream = UnixStream::connect(path).await?;
         let request_id = 1u64;
-        let load_options = format!("audio-files={audio_url},start={position}");
+        let load_options = playlist_load_options(item, audio_url, position)?;
         let mut bytes = serde_json::to_vec(&serde_json::json!({
             "command": [
                 "loadfile",
@@ -497,6 +535,26 @@ async fn loadfile_and_wait(
     })
     .await
     .map_err(|_| anyhow::anyhow!("MPV file load timed out"))?
+}
+
+async fn append_playlist_media(
+    path: &std::path::Path,
+    item: &PlaylistItem,
+    prepared: &PreparedPlaylistItem,
+) -> Result<()> {
+    let options = playlist_load_options(Some(item), &prepared.proxy.audio_url, 0.0)?;
+    mpv_ipc(
+        path,
+        serde_json::json!([
+            "loadfile",
+            prepared.proxy.video_url,
+            "append-play",
+            -1,
+            options
+        ]),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn mpv_time_pos(path: &std::path::Path) -> Option<f64> {
@@ -563,7 +621,42 @@ async fn replace_mpv_stream(
     audio_url: &str,
     position: f64,
 ) -> Result<()> {
-    loadfile_and_wait(path, video_url, audio_url, position).await
+    let playlist_pos = mpv_ipc(path, serde_json::json!(["get_property", "playlist-pos"]))
+        .await?
+        .get("data")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("MPV playlist position is unavailable"))?;
+    let options = playlist_load_options(None, audio_url, position)?;
+
+    // Insert the replacement beside the current entry, remove the stale entry,
+    // then select the replacement. A plain `loadfile replace` would erase every
+    // remaining part from mpv's native playlist.
+    mpv_ipc(
+        path,
+        serde_json::json!(["loadfile", video_url, "insert-at", playlist_pos, options]),
+    )
+    .await?;
+    mpv_ipc(
+        path,
+        serde_json::json!(["playlist-remove", playlist_pos + 1]),
+    )
+    .await?;
+    mpv_ipc(
+        path,
+        serde_json::json!(["playlist-play-index", playlist_pos]),
+    )
+    .await?;
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if mpv_path(path).await.as_deref() == Some(video_url) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("MPV replacement stream load timed out"))?
 }
 
 async fn switch_to_working_video_cdn(
@@ -610,9 +703,10 @@ pub async fn play_playlist(
     cmd.stderr(Stdio::piped());
     cmd.arg("--idle=yes");
     cmd.arg("--force-window=immediate");
+    configure_vod_buffering(&mut cmd);
     cmd.arg("--msg-level=ffmpeg=error,vd=warn");
     cmd.arg("--ytdl=no");
-    cmd.arg("--script-opts-append=double_video_fps=yes");
+    cmd.arg("--script-opts-append=double_video_fps=no");
     let ipc_path = std::env::temp_dir().join(format!(
         "bilibili-tui-playlist-{}-{session_id}.sock",
         std::process::id()
@@ -788,6 +882,28 @@ async fn run_playlist(
     let mut start_ts = chrono::Utc::now().timestamp();
     let mut played_any = false;
     start_playlist_media(ipc_path, &items[index], &prepared).await?;
+
+    // Materialize the remaining items in mpv's native playlist. Previously we
+    // loaded each part with `replace` only after the preceding part ended,
+    // which kept `playlist-count` at one and made mpv's playlist UI useless.
+    let mut queued_prepared: Vec<Option<PreparedPlaylistItem>> =
+        std::iter::repeat_with(|| None).take(items.len()).collect();
+    let mut preload_failures = Vec::new();
+    for next_index in (index + 1)..items.len() {
+        let Some(next_prepared) = accept_prepared_result(
+            &items[next_index],
+            prepare_playlist_item(&api_client, &items[next_index]).await,
+            &mut preload_failures,
+        ) else {
+            continue;
+        };
+        match append_playlist_media(ipc_path, &items[next_index], &next_prepared).await {
+            Ok(()) => queued_prepared[next_index] = Some(next_prepared),
+            Err(error) => preload_failures.push(format!("{}: {error:#}", items[next_index].bvid)),
+        }
+    }
+    log_skipped_playlist_items(&preload_failures);
+
     let _ = tx.send(PlaybackEvent::ItemChanged {
         session_id,
         index,
@@ -838,7 +954,20 @@ async fn run_playlist(
                 };
             }
             reason = end_rx.recv() => {
-                let Some(reason) = reason else { break Err(anyhow::anyhow!("MPV IPC event stream closed")); };
+                let Some(reason) = reason else {
+                    // MPV closes every IPC client while shutting down. The event
+                    // socket can therefore reach EOF just before `child.wait()`
+                    // becomes ready; do not report that normal race as a playlist
+                    // failure.
+                    break match timeout(Duration::from_secs(2), child.wait()).await {
+                        Ok(Ok(status)) if status.success() => Ok(()),
+                        Ok(Ok(status)) => Err(anyhow::anyhow!("MPV exited with {status}")),
+                        Ok(Err(error)) => Err(error.into()),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "MPV IPC event stream closed while MPV was still running"
+                        )),
+                    };
+                };
                 if reason == "error" {
                     if !corrupted {
                         prepared.proxy.record_current_corruption();
@@ -859,9 +988,9 @@ async fn run_playlist(
                     played_any = true;
                     if !corrupted { prepared.proxy.record_success(); }
                 }
-                let (next, skipped) = prepare_next_playlist_item(&api_client, &items, index + 1).await;
-                log_skipped_playlist_items(&skipped);
-                let Some((next_index, next_prepared)) = next else {
+                let Some(next_index) = ((index + 1)..items.len())
+                    .find(|candidate| queued_prepared[*candidate].is_some())
+                else {
                     let _ = mpv_ipc(ipc_path, serde_json::json!(["quit"])).await;
                     break match child.wait().await {
                         Ok(status) if status.success() && played_any => Ok(()),
@@ -871,8 +1000,10 @@ async fn run_playlist(
                     };
                 };
                 index = next_index;
-                prepared = next_prepared;
-                start_playlist_media(ipc_path, &items[index], &prepared).await?;
+                prepared = queued_prepared[index]
+                    .take()
+                    .expect("playable playlist item disappeared");
+                set_playlist_item_context(ipc_path, &items[index], &prepared).await;
                 played_time = 0;
                 corrupted = false;
                 item_started = Instant::now();
@@ -924,11 +1055,11 @@ async fn wait_for_ipc(path: &std::path::Path, child: &mut tokio::process::Child)
     }
 }
 
-async fn start_playlist_media(
+async fn set_playlist_item_context(
     path: &std::path::Path,
     item: &PlaylistItem,
     prepared: &PreparedPlaylistItem,
-) -> Result<()> {
+) {
     let page = match item.page {
         Some(page) if page > 1 => format!("https://www.bilibili.com/video/{}?p={page}", item.bvid),
         _ => format!("https://www.bilibili.com/video/{}", item.bvid),
@@ -939,12 +1070,21 @@ async fn start_playlist_media(
         serde_json::json!([
             "set_property",
             "options/script-opts",
-            format!("cid={}", prepared.cid)
+            format!("cid={},double_video_fps=no", prepared.cid)
         ]),
     )
     .await;
+}
+
+async fn start_playlist_media(
+    path: &std::path::Path,
+    item: &PlaylistItem,
+    prepared: &PreparedPlaylistItem,
+) -> Result<()> {
+    set_playlist_item_context(path, item, prepared).await;
     loadfile_and_wait(
         path,
+        Some(item),
         &prepared.proxy.video_url,
         &prepared.proxy.audio_url,
         0.0,

@@ -96,6 +96,12 @@ struct ProbeScore {
     throughput_bps: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReliabilityOutcome {
+    recorded_at: i64,
+    corrupted: bool,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct CdnHistory {
@@ -116,6 +122,7 @@ struct CdnHistory {
     catalog_reachable: Option<bool>,
     catalog_latency_ms: Option<f64>,
     catalog_probed_at: i64,
+    reliability_outcomes: Vec<ReliabilityOutcome>,
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +141,15 @@ struct HistoryWrite {
 
 static HISTORY_WRITER: OnceLock<mpsc::Sender<HistoryWrite>> = OnceLock::new();
 static HISTORY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+// Treat sparse playback history as weak evidence. Playback outcomes lose
+// influence at explicit age boundaries and are discarded after 30 days.
+const RELIABILITY_PRIOR_SUCCESSES: f64 = 45.0;
+const RELIABILITY_PRIOR_FAILURES: f64 = 5.0;
+const HOUR_SECS: i64 = 60 * 60;
+const DAY_SECS: i64 = 24 * HOUR_SECS;
+const MONTH_SECS: i64 = 30 * DAY_SECS;
+const MAX_MIGRATED_OUTCOMES: u64 = 256;
 
 fn scores() -> &'static Mutex<HashMap<String, CachedScore>> {
     CDN_SCORES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -155,10 +171,14 @@ fn history_path() -> Option<PathBuf> {
 
 fn history() -> &'static Mutex<HashMap<String, CdnHistory>> {
     CDN_HISTORY.get_or_init(|| {
-        let values: HashMap<String, CdnHistory> = history_path()
+        let mut values: HashMap<String, CdnHistory> = history_path()
             .and_then(|path| fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+        let now = chrono::Utc::now().timestamp();
+        for value in values.values_mut() {
+            migrate_reliability_history(value, now);
+        }
         let _ = CDN_HISTORY_BASE.set(values.clone());
         Mutex::new(values)
     })
@@ -222,6 +242,17 @@ fn write_history(
         target.probe_failures = target
             .probe_failures
             .saturating_add(value.probe_failures.saturating_sub(old.probe_failures));
+        let value_latest_outcome = value
+            .reliability_outcomes
+            .last()
+            .map_or(0, |outcome| outcome.recorded_at);
+        let target_latest_outcome = target
+            .reliability_outcomes
+            .last()
+            .map_or(0, |outcome| outcome.recorded_at);
+        if value_latest_outcome >= target_latest_outcome {
+            target.reliability_outcomes = value.reliability_outcomes.clone();
+        }
         if value.last_probed_at >= target.last_probed_at {
             target.last_probe_ok = value.last_probe_ok;
             target.latency_ms = value.latency_ms;
@@ -367,13 +398,76 @@ fn record_rank(host: &str, kind: StreamKind, score: f64, speed_ratio: f64, bandw
     }
 }
 
+fn reliability_weight(elapsed_secs: i64) -> Option<f64> {
+    match elapsed_secs.max(0) {
+        age if age <= HOUR_SECS => Some(1.0),
+        age if age <= DAY_SECS => Some(0.75),
+        age if age <= 3 * DAY_SECS => Some(0.50),
+        age if age <= 5 * DAY_SECS => Some(0.40),
+        age if age <= 7 * DAY_SECS => Some(0.30),
+        age if age <= MONTH_SECS => Some(0.20),
+        _ => None,
+    }
+}
+
+fn migrate_reliability_history(value: &mut CdnHistory, now: i64) {
+    if !value.reliability_outcomes.is_empty() || value.attempts == 0 {
+        return;
+    }
+    let sample_count = value.attempts.min(MAX_MIGRATED_OUTCOMES);
+    let failure_ratio = value.corruptions.min(value.attempts) as f64 / value.attempts as f64;
+    let failure_count = (failure_ratio * sample_count as f64).round() as u64;
+    let success_count = sample_count.saturating_sub(failure_count);
+    value
+        .reliability_outcomes
+        .extend((0..success_count).map(|_| ReliabilityOutcome {
+            recorded_at: now,
+            corrupted: false,
+        }));
+    value
+        .reliability_outcomes
+        .extend((0..failure_count).map(|_| ReliabilityOutcome {
+            recorded_at: now,
+            corrupted: true,
+        }));
+}
+
+fn prune_reliability_history(value: &mut CdnHistory, now: i64) {
+    migrate_reliability_history(value, now);
+    value
+        .reliability_outcomes
+        .retain(|outcome| reliability_weight(now.saturating_sub(outcome.recorded_at)).is_some());
+}
+
+fn reliability_value(value: &CdnHistory, now: i64) -> f64 {
+    let mut successes = RELIABILITY_PRIOR_SUCCESSES;
+    let mut failures = RELIABILITY_PRIOR_FAILURES;
+    for outcome in &value.reliability_outcomes {
+        let Some(weight) = reliability_weight(now.saturating_sub(outcome.recorded_at)) else {
+            continue;
+        };
+        if outcome.corrupted {
+            failures += weight;
+        } else {
+            successes += weight;
+        }
+    }
+    successes / (successes + failures)
+}
+
 pub fn record_cdn_result(host: &str, corrupted: bool) {
     let snapshot = if let Ok(mut values) = history().lock() {
         let entry = values.entry(host.to_string()).or_default();
+        let now = chrono::Utc::now().timestamp();
+        prune_reliability_history(entry, now);
         entry.attempts = entry.attempts.saturating_add(1);
         if corrupted {
             entry.corruptions = entry.corruptions.saturating_add(1);
         }
+        entry.reliability_outcomes.push(ReliabilityOutcome {
+            recorded_at: now,
+            corrupted,
+        });
         Some(values.clone())
     } else {
         None
@@ -391,7 +485,7 @@ fn reliability(host: &str) -> f64 {
         .ok()
         .and_then(|values| values.get(host).cloned())
         .unwrap_or_default();
-    1.0 - (value.corruptions as f64 + 1.0) / (value.attempts as f64 + 10.0)
+    reliability_value(&value, chrono::Utc::now().timestamp())
 }
 
 fn cached_score(url: &str) -> Option<ProbeScore> {
@@ -647,6 +741,79 @@ mod tests {
         assert_eq!(value.probe_samples, 0);
         assert!(value.video_score.is_none());
         assert_eq!(value.catalog_reachable, None);
+    }
+
+    #[test]
+    fn one_sparse_failure_does_not_destroy_reliability() {
+        let now = 1_000_000;
+        let value = CdnHistory {
+            reliability_outcomes: vec![ReliabilityOutcome {
+                recorded_at: now,
+                corrupted: true,
+            }],
+            ..CdnHistory::default()
+        };
+        let reliability = reliability_value(&value, now);
+        assert!((reliability - 45.0 / 51.0).abs() < f64::EPSILON);
+        assert!(reliability > 0.88);
+    }
+
+    #[test]
+    fn reliability_uses_requested_age_buckets() {
+        assert_eq!(reliability_weight(HOUR_SECS), Some(1.0));
+        assert_eq!(reliability_weight(HOUR_SECS + 1), Some(0.75));
+        assert_eq!(reliability_weight(DAY_SECS + 1), Some(0.50));
+        assert_eq!(reliability_weight(3 * DAY_SECS + 1), Some(0.40));
+        assert_eq!(reliability_weight(5 * DAY_SECS + 1), Some(0.30));
+        assert_eq!(reliability_weight(7 * DAY_SECS + 1), Some(0.20));
+        assert_eq!(reliability_weight(MONTH_SECS + 1), None);
+    }
+
+    #[test]
+    fn outcomes_older_than_thirty_days_are_deleted() {
+        let now = 2_000_000;
+        let mut value = CdnHistory {
+            reliability_outcomes: vec![
+                ReliabilityOutcome {
+                    recorded_at: now - MONTH_SECS,
+                    corrupted: false,
+                },
+                ReliabilityOutcome {
+                    recorded_at: now - MONTH_SECS - 1,
+                    corrupted: true,
+                },
+            ],
+            ..CdnHistory::default()
+        };
+        prune_reliability_history(&mut value, now);
+        assert_eq!(value.reliability_outcomes.len(), 1);
+        assert!(!value.reliability_outcomes[0].corrupted);
+    }
+
+    #[test]
+    fn legacy_counts_migrate_into_timestamped_outcomes() {
+        let now = 3_000_000;
+        let mut value = CdnHistory {
+            attempts: 10,
+            corruptions: 2,
+            ..CdnHistory::default()
+        };
+        migrate_reliability_history(&mut value, now);
+        assert_eq!(value.reliability_outcomes.len(), 10);
+        assert_eq!(
+            value
+                .reliability_outcomes
+                .iter()
+                .filter(|outcome| outcome.corrupted)
+                .count(),
+            2
+        );
+        assert!(
+            value
+                .reliability_outcomes
+                .iter()
+                .all(|outcome| outcome.recorded_at == now)
+        );
     }
 
     #[test]
