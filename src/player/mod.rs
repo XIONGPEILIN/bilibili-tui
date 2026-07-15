@@ -7,21 +7,33 @@ use crate::storage::{Credentials, DanmakuConfig};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::io::Write as StdWrite;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
+use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Instant, interval_at, timeout};
 
 mod proxy;
 
 static LIVE_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MPV_IPC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_VOD_SESSION: AtomicU64 = AtomicU64::new(0);
+static REUSABLE_VOD_MPV: OnceLock<Mutex<Option<ReusableVodMpv>>> = OnceLock::new();
 const LIVE_DANMAKU_SCRIPT: &str = include_str!("live_danmaku.lua");
+
+#[derive(Clone)]
+struct ReusableVodMpv {
+    ipc_path: PathBuf,
+    danmaku_script_path: PathBuf,
+    stderr_tx: broadcast::Sender<String>,
+}
 
 fn configure_vod_buffering(cmd: &mut Command) {
     // 用户配置可能全局启用了 low-latency；这些选项会让分离的 DASH
@@ -35,6 +47,89 @@ fn configure_vod_buffering(cmd: &mut Command) {
     cmd.arg("--demuxer-lavf-analyzeduration=0");
     cmd.arg("--video-latency-hacks=no");
     cmd.arg("--stream-buffer-size=128KiB");
+}
+
+fn reusable_vod_mpv_state() -> &'static Mutex<Option<ReusableVodMpv>> {
+    REUSABLE_VOD_MPV.get_or_init(|| Mutex::new(None))
+}
+
+fn is_active_vod_session(session_id: u64) -> bool {
+    ACTIVE_VOD_SESSION.load(Ordering::Acquire) == session_id
+}
+
+async fn ensure_reusable_vod_mpv() -> Result<ReusableVodMpv> {
+    let mut state = reusable_vod_mpv_state().lock().await;
+    if let Some(existing) = state.as_ref()
+        && mpv_ipc(
+            &existing.ipc_path,
+            serde_json::json!(["get_property", "idle-active"]),
+        )
+        .await
+        .is_ok()
+    {
+        return Ok(existing.clone());
+    }
+    *state = None;
+
+    let ipc_path =
+        std::env::temp_dir().join(format!("bilibili-tui-vod-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&ipc_path);
+    let _ = std::fs::remove_file(ipc_path.with_extension("danmaku.lua"));
+    let danmaku_script_path = create_live_danmaku_script(&ipc_path)?;
+
+    let mut cmd = Command::new("mpv");
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    cmd.arg("--idle=yes");
+    cmd.arg("--force-window=immediate");
+    configure_vod_buffering(&mut cmd);
+    cmd.arg(format!("--input-ipc-server={}", ipc_path.display()));
+    cmd.arg(format!("--script={}", danmaku_script_path.display()));
+    cmd.arg("--script-opts-append=double_video_fps=no");
+    cmd.arg("--msg-level=ffmpeg=error,vd=warn");
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&danmaku_script_path);
+            return Err(error.into());
+        }
+    };
+    let stderr = child.stderr.take();
+    if let Err(error) = wait_for_ipc(&ipc_path, &mut child).await {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = std::fs::remove_file(&ipc_path);
+        let _ = std::fs::remove_file(&danmaku_script_path);
+        return Err(error);
+    }
+
+    let (stderr_tx, _) = broadcast::channel(256);
+    if let Some(stderr) = stderr {
+        let tx = stderr_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(line);
+            }
+        });
+    }
+
+    let cleanup_ipc = ipc_path.clone();
+    let cleanup_script = danmaku_script_path.clone();
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+        let _ = tokio::fs::remove_file(cleanup_ipc).await;
+        let _ = tokio::fs::remove_file(cleanup_script).await;
+    });
+
+    let process = ReusableVodMpv {
+        ipc_path,
+        danmaku_script_path,
+        stderr_tx,
+    };
+    *state = Some(process.clone());
+    Ok(process)
 }
 
 /// Play a video using mpv with yt-dlp and report watch progress
@@ -57,11 +152,6 @@ pub async fn play_video(
         _ => format!("https://www.bilibili.com/video/{}", bvid),
     };
 
-    // Report watch start
-    let _ = crate::api::heartbeat::report_watch_start(&api_client, aid, cid, bvid, duration).await;
-
-    let start_ts = chrono::Utc::now().timestamp();
-
     let mut media_proxy = match api_client.get_play_url(bvid, cid).await {
         Ok(play_url) => match crate::api::cdn::rank_streams(&play_url).await {
             Ok(streams) => proxy::MediaProxy::start(streams).await.ok(),
@@ -71,67 +161,77 @@ pub async fn play_video(
     };
 
     let danmaku = api_client.get_video_danmaku(cid).await.unwrap_or_default();
-    let ipc_path = std::env::temp_dir().join(format!(
-        "bilibili-tui-mpv-{}-{}.sock",
-        std::process::id(),
-        cid
-    ));
-    let _ = std::fs::remove_file(&ipc_path);
-    let _ = std::fs::remove_file(ipc_path.with_extension("danmaku.lua"));
-    let danmaku_script_path = create_live_danmaku_script(&ipc_path)?;
-
-    let mut cmd = Command::new("mpv");
-
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
-
-    let cookie_path_to_clean = if let Some(creds) = credentials {
-        let cookie_path = crate::storage::export_cookies_for_ytdlp(creds)?;
-        cmd.arg(format!(
-            "--ytdl-raw-options=cookies={}",
-            cookie_path.display()
-        ));
-        Some(cookie_path)
-    } else {
-        None
+    let player = ensure_reusable_vod_mpv().await?;
+    let ipc_path = player.ipc_path.clone();
+    let danmaku_script_path = player.danmaku_script_path.clone();
+    let mut stderr = player.stderr_tx.subscribe();
+    ACTIVE_VOD_SESSION.store(session_id, Ordering::Release);
+    let (end_tx, mut end_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let event_path = ipc_path.clone();
+    let event_task =
+        tokio::spawn(async move { observe_end_files(&event_path, end_tx, ready_tx).await });
+    let observer_ready = match timeout(Duration::from_secs(2), ready_rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(anyhow::anyhow!("MPV event observer failed to start")),
+        Err(_) => Err(anyhow::anyhow!("MPV event observer timed out")),
     };
-
-    cmd.arg("--force-window=immediate");
-    // Use MPV's low-latency profile for Bilibili VOD playback.
-    configure_vod_buffering(&mut cmd);
-    // The TUI owns VOD danmaku rendering through the same OSD script used by
-    // live playback. Do not pass CID to global MPV scripts, which would add a
-    // second ASS subtitle track.
-    cmd.arg(format!("--referrer={webpage_url}"));
-    cmd.arg(format!("--http-header-fields=Referer: {webpage_url}"));
-    cmd.arg(format!("--input-ipc-server={}", ipc_path.display()));
-    cmd.arg(format!("--script={}", danmaku_script_path.display()));
-    cmd.arg("--script-opts-append=double_video_fps=no");
-    cmd.arg("--msg-level=ffmpeg=error,vd=warn");
-    if let Some(proxy) = &media_proxy {
-        cmd.arg("--ytdl=no");
-        cmd.arg(format!("--audio-file={}", proxy.audio_url));
-        cmd.arg(&proxy.video_url);
-    } else {
-        cmd.arg("--ytdl-format=bestvideo+bestaudio/best");
-        cmd.arg(&webpage_url);
+    if let Err(error) = observer_ready {
+        event_task.abort();
+        return Err(error);
     }
 
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(error) => {
+    let item = PlaylistItem {
+        bvid: bvid.to_string(),
+        aid,
+        cid: Some(cid),
+        title: bvid.to_string(),
+        uploader_mid: None,
+        duration: Some(duration),
+        page: page_num,
+    };
+    let load_result: Result<()> = async {
+        if let Some(proxy) = &media_proxy {
+            loadfile_and_wait(
+                &ipc_path,
+                Some(&item),
+                &proxy.video_url,
+                &proxy.audio_url,
+                0.0,
+            )
+            .await
+        } else {
+            let cookie_path_to_clean = if let Some(creds) = credentials {
+                Some(crate::storage::export_cookies_for_ytdlp(creds)?)
+            } else {
+                None
+            };
+            if let Some(path) = &cookie_path_to_clean {
+                let _ = mpv_ipc(
+                    &ipc_path,
+                    serde_json::json!([
+                        "set_property",
+                        "options/ytdl-raw-options",
+                        format!("cookies={}", path.display())
+                    ]),
+                )
+                .await;
+            }
+            let result = load_url_and_wait(&ipc_path, &webpage_url).await;
             if let Some(path) = &cookie_path_to_clean {
                 let _ = crate::storage::remove_cookie_export(path);
             }
-            let _ = std::fs::remove_file(&danmaku_script_path);
-            return Err(error.into());
+            result
         }
-    };
-    let stderr = child
-        .stderr
-        .take()
-        .map(BufReader::new)
-        .map(|reader| reader.lines());
+    }
+    .await;
+    if let Err(error) = load_result {
+        event_task.abort();
+        return Err(error);
+    }
+
+    let _ = crate::api::heartbeat::report_watch_start(&api_client, aid, cid, bvid, duration).await;
+    let start_ts = chrono::Utc::now().timestamp();
 
     // Clone bvid for the background task (needs 'static lifetime)
     let bvid = bvid.to_string();
@@ -149,7 +249,6 @@ pub async fn play_video(
             Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
         );
-        let mut stderr = stderr;
         let mut decode_errors = VecDeque::new();
         let mut last_switch = Instant::now() - Duration::from_secs(10);
         let mut exit_error = None;
@@ -160,8 +259,16 @@ pub async fn play_video(
         let mut danmaku_ready = false;
 
         loop {
+            if !is_active_vod_session(session_id) {
+                event_task.abort();
+                return;
+            }
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
+                    if !is_active_vod_session(session_id) {
+                        event_task.abort();
+                        return;
+                    }
                     let real_played_time = start_time.elapsed().as_secs() as i64;
 
                     let _ = crate::api::heartbeat::report_heartbeat(
@@ -177,11 +284,19 @@ pub async fn play_video(
                     ).await;
                 }
                 _ = position_interval.tick() => {
+                    if !is_active_vod_session(session_id) {
+                        event_task.abort();
+                        return;
+                    }
                     if let Some(position) = mpv_time_pos(&ipc_path).await {
                         played_time = position.max(0.0) as i64;
                     }
                 }
                 _ = danmaku_interval.tick(), if next_danmaku < danmaku.len() => {
+                    if !is_active_vod_session(session_id) {
+                        event_task.abort();
+                        return;
+                    }
                     if let Some(position) = mpv_time_pos(&ipc_path).await {
                         if !danmaku_ready {
                             danmaku_ready = send_live_danmaku_config(
@@ -212,7 +327,11 @@ pub async fn play_video(
                         .await;
                     }
                 }
-                result = child.wait() => {
+                reason = end_rx.recv() => {
+                    if !is_active_vod_session(session_id) {
+                        event_task.abort();
+                        return;
+                    }
                     let real_played_time = start_time.elapsed().as_secs() as i64;
 
                     let _ = crate::api::heartbeat::report_heartbeat(
@@ -227,27 +346,61 @@ pub async fn play_video(
                         4, // play_type: 4 = end
                     ).await;
 
-                    if result.as_ref().is_ok_and(|status| status.success())
-                        && !current_cdn_corrupted
-                        && let Some(proxy) = &media_proxy
-                    {
-                        proxy.record_success();
+                    let Some(reason) = reason else {
+                        exit_error = Some("MPV IPC event stream closed".to_string());
+                        break;
+                    };
+                    if reason == "error" {
+                        if let Some(proxy) = &mut media_proxy {
+                            if !current_cdn_corrupted {
+                                proxy.record_current_corruption();
+                                current_cdn_corrupted = true;
+                            }
+                            let position = mpv_time_pos(&ipc_path).await.unwrap_or(played_time as f64);
+                            let previous_url = proxy.video_url.clone();
+                            let switched = if let Some((next, video_url)) = proxy.next_video_cdn() {
+                                let switched = replace_mpv_stream(
+                                    &ipc_path,
+                                    &video_url,
+                                    &proxy.audio_url,
+                                    position,
+                                ).await.is_ok();
+                                if switched {
+                                    proxy.commit_video_cdn(next);
+                                    current_cdn_corrupted = false;
+                                    last_switch = Instant::now();
+                                }
+                                switched
+                            } else {
+                                false
+                            };
+                            if switched {
+                                continue;
+                            }
+                            let _ = replace_mpv_stream(
+                                &ipc_path,
+                                &previous_url,
+                                &proxy.audio_url,
+                                position,
+                            ).await;
+                        }
+                        exit_error = Some("MPV reported a playback error".to_string());
+                        break;
                     }
-                    if !result.as_ref().is_ok_and(|status| status.success()) {
-                        exit_error = Some(match result {
-                            Ok(status) => format!("MPV exited with {status}"),
-                            Err(error) => format!("failed waiting for MPV: {error}"),
-                        });
+                    if reason != "eof" {
+                        continue;
+                    }
+                    if !current_cdn_corrupted && let Some(proxy) = &media_proxy {
+                        proxy.record_success();
                     }
                     break;
                 }
-                line = async {
-                    match &mut stderr {
-                        Some(lines) => lines.next_line().await,
-                        None => std::future::pending().await,
+                line = stderr.recv() => {
+                    let Ok(line) = line else { continue };
+                    if !is_active_vod_session(session_id) {
+                        event_task.abort();
+                        return;
                     }
-                } => {
-                    let Ok(Some(line)) = line else { stderr = None; continue };
                     if is_corrupt_video_log(&line) {
                         let now = Instant::now();
                         decode_errors.push_back(now);
@@ -263,26 +416,26 @@ pub async fn play_video(
                                 current_cdn_corrupted = true;
                             }
                             if let Some((next, video_url)) = proxy.next_video_cdn() {
-                            let position = mpv_time_pos(&ipc_path).await.unwrap_or(0.0);
-                            let previous_url = proxy.video_url.clone();
-                            let switched = replace_mpv_stream(
-                                &ipc_path,
-                                &video_url,
-                                &proxy.audio_url,
-                                position,
-                            ).await.is_ok() || mpv_path(&ipc_path).await.as_deref() == Some(video_url.as_str());
-                            if switched {
-                                proxy.commit_video_cdn(next);
-                                current_cdn_corrupted = false;
-                                last_switch = Instant::now();
-                            } else {
-                                let _ = replace_mpv_stream(
+                                let position = mpv_time_pos(&ipc_path).await.unwrap_or(0.0);
+                                let previous_url = proxy.video_url.clone();
+                                let switched = replace_mpv_stream(
                                     &ipc_path,
-                                    &previous_url,
+                                    &video_url,
                                     &proxy.audio_url,
                                     position,
-                                ).await;
-                            }
+                                ).await.is_ok();
+                                if switched {
+                                    proxy.commit_video_cdn(next);
+                                    current_cdn_corrupted = false;
+                                    last_switch = Instant::now();
+                                } else {
+                                    let _ = replace_mpv_stream(
+                                        &ipc_path,
+                                        &previous_url,
+                                        &proxy.audio_url,
+                                        position,
+                                    ).await;
+                                }
                             }
                         }
                     }
@@ -290,12 +443,10 @@ pub async fn play_video(
             }
         }
 
-        // Cleanup cookie file
-        if let Some(path) = cookie_path_to_clean {
-            let _ = crate::storage::remove_cookie_export(&path);
+        event_task.abort();
+        if !is_active_vod_session(session_id) {
+            return;
         }
-        let _ = tokio::fs::remove_file(&ipc_path).await;
-        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
         let event = match exit_error {
             Some(error) => PlaybackEvent::Failed { session_id, error },
             None => PlaybackEvent::Finished {
@@ -431,7 +582,15 @@ fn mpv_script_name(script_path: &std::path::Path) -> String {
 }
 
 async fn mpv_ipc(path: &std::path::Path, command: serde_json::Value) -> Result<serde_json::Value> {
-    timeout(Duration::from_secs(2), async {
+    mpv_ipc_with_timeout(path, command, Duration::from_secs(2)).await
+}
+
+async fn mpv_ipc_with_timeout(
+    path: &std::path::Path,
+    command: serde_json::Value,
+    duration: Duration,
+) -> Result<serde_json::Value> {
+    timeout(duration, async {
         let mut stream = UnixStream::connect(path).await?;
         let request_id = MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let mut bytes = serde_json::to_vec(&serde_json::json!({
@@ -471,14 +630,15 @@ fn playlist_load_options(
     item: Option<&PlaylistItem>,
     audio_url: &str,
     position: f64,
-) -> Result<String> {
-    if audio_url.contains(',') {
-        anyhow::bail!("audio CDN URL cannot be represented as an MPV option list");
-    }
-    let mut options = vec![
-        format!("audio-files={audio_url}"),
-        format!("start={position}"),
-    ];
+) -> serde_json::Value {
+    let mut options = serde_json::Map::new();
+    options.insert("audio-files-clr".to_string(), serde_json::json!(""));
+    options.insert(
+        "audio-files-append".to_string(),
+        serde_json::json!(audio_url),
+    );
+    options.insert("aid".to_string(), serde_json::json!("auto"));
+    options.insert("start".to_string(), serde_json::json!(position.to_string()));
     if let Some(item) = item {
         let page_url = match item.page {
             Some(page) if page > 1 => {
@@ -487,10 +647,10 @@ fn playlist_load_options(
             _ => format!("https://www.bilibili.com/video/{}", item.bvid),
         };
         let title = item.title.replace([',', '\n', '\r'], " ");
-        options.push(format!("referrer={page_url}"));
-        options.push(format!("force-media-title={title}"));
+        options.insert("referrer".to_string(), serde_json::json!(page_url));
+        options.insert("force-media-title".to_string(), serde_json::json!(title));
     }
-    Ok(options.join(","))
+    serde_json::Value::Object(options)
 }
 
 async fn loadfile_and_wait(
@@ -502,8 +662,8 @@ async fn loadfile_and_wait(
 ) -> Result<()> {
     timeout(Duration::from_secs(10), async {
         let mut stream = UnixStream::connect(path).await?;
-        let request_id = 1u64;
-        let load_options = playlist_load_options(item, audio_url, position)?;
+        let request_id = MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let load_options = playlist_load_options(item, audio_url, position);
         let mut bytes = serde_json::to_vec(&serde_json::json!({
             "command": [
                 "loadfile",
@@ -531,10 +691,83 @@ async fn loadfile_and_wait(
             }
             loaded |= value.get("event").and_then(|value| value.as_str()) == Some("file-loaded");
         }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("MPV file load timed out"))??;
+    ensure_mpv_external_audio(path, audio_url).await
+}
+
+async fn mpv_selected_audio_external_filename(path: &std::path::Path) -> Option<String> {
+    mpv_ipc(
+        path,
+        serde_json::json!(["get_property", "current-tracks/audio"]),
+    )
+    .await
+    .ok()?
+    .get("data")?
+    .get("external-filename")?
+    .as_str()
+    .map(str::to_owned)
+}
+
+async fn ensure_mpv_external_audio(path: &std::path::Path, audio_url: &str) -> Result<()> {
+    if mpv_selected_audio_external_filename(path).await.as_deref() == Some(audio_url) {
+        return Ok(());
+    }
+    mpv_ipc_with_timeout(
+        path,
+        serde_json::json!(["audio-add", audio_url, "select", "Bilibili audio"]),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if mpv_selected_audio_external_filename(path).await.as_deref() == Some(audio_url) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    anyhow::bail!("MPV did not attach external audio")
+}
+
+async fn load_url_and_wait(path: &std::path::Path, url: &str) -> Result<()> {
+    timeout(Duration::from_secs(10), async {
+        let mut stream = UnixStream::connect(path).await?;
+        let request_id = MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "command": ["loadfile", url, "replace"],
+            "request_id": request_id,
+        }))?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
+        let mut lines = BufReader::new(stream).lines();
+        let mut command_ok = false;
+        let mut loaded = false;
+        while !(command_ok && loaded) {
+            let line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("MPV IPC closed"))?;
+            let value: serde_json::Value = serde_json::from_str(&line)?;
+            if value.get("request_id").and_then(|value| value.as_u64()) == Some(request_id) {
+                ensure_mpv_success(&value)?;
+                command_ok = true;
+            }
+            match value.get("event").and_then(|value| value.as_str()) {
+                Some("file-loaded") => loaded = true,
+                Some("end-file")
+                    if value.get("reason").and_then(|value| value.as_str()) == Some("error") =>
+                {
+                    anyhow::bail!("MPV failed to load URL")
+                }
+                _ => {}
+            }
+        }
         Ok(())
     })
     .await
-    .map_err(|_| anyhow::anyhow!("MPV file load timed out"))?
+    .map_err(|_| anyhow::anyhow!("MPV URL load timed out"))?
 }
 
 async fn append_playlist_media(
@@ -542,7 +775,7 @@ async fn append_playlist_media(
     item: &PlaylistItem,
     prepared: &PreparedPlaylistItem,
 ) -> Result<()> {
-    let options = playlist_load_options(Some(item), &prepared.proxy.audio_url, 0.0)?;
+    let options = playlist_load_options(Some(item), &prepared.proxy.audio_url, 0.0);
     mpv_ipc(
         path,
         serde_json::json!([
@@ -598,7 +831,7 @@ async fn load_live_and_wait(path: &std::path::Path, url: &str) -> Result<()> {
                 _ => {}
             }
             if command_ok && loaded {
-                return Ok(());
+                return Ok::<(), anyhow::Error>(());
             }
         }
     })
@@ -626,7 +859,7 @@ async fn replace_mpv_stream(
         .get("data")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| anyhow::anyhow!("MPV playlist position is unavailable"))?;
-    let options = playlist_load_options(None, audio_url, position)?;
+    let options = playlist_load_options(None, audio_url, position);
 
     // Insert the replacement beside the current entry, remove the stale entry,
     // then select the replacement. A plain `loadfile replace` would erase every
@@ -650,13 +883,14 @@ async fn replace_mpv_stream(
     timeout(Duration::from_secs(10), async {
         loop {
             if mpv_path(path).await.as_deref() == Some(video_url) {
-                return Ok(());
+                return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("MPV replacement stream load timed out"))?
+    .map_err(|_| anyhow::anyhow!("MPV replacement stream load timed out"))??;
+    ensure_mpv_external_audio(path, audio_url).await
 }
 
 async fn switch_to_working_video_cdn(
@@ -669,8 +903,7 @@ async fn switch_to_working_video_cdn(
     while let Some((index, url)) = candidate {
         let switched = replace_mpv_stream(ipc_path, &url, &prepared.proxy.audio_url, position)
             .await
-            .is_ok()
-            || mpv_path(ipc_path).await.as_deref() == Some(url.as_str());
+            .is_ok();
         if switched {
             return prepared.proxy.commit_video_cdn(index);
         }
@@ -698,34 +931,11 @@ pub async fn play_playlist(
     };
     log_skipped_playlist_items(&skipped);
 
-    let mut cmd = Command::new("mpv");
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
-    cmd.arg("--idle=yes");
-    cmd.arg("--force-window=immediate");
-    configure_vod_buffering(&mut cmd);
-    cmd.arg("--msg-level=ffmpeg=error,vd=warn");
-    cmd.arg("--ytdl=no");
-    cmd.arg("--script-opts-append=double_video_fps=no");
-    let ipc_path = std::env::temp_dir().join(format!(
-        "bilibili-tui-playlist-{}-{session_id}.sock",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&ipc_path);
-    cmd.arg(format!("--input-ipc-server={}", ipc_path.display()));
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(error) => return Err(error.into()),
-    };
-    let stderr = child
-        .stderr
-        .take()
-        .map(BufReader::new)
-        .map(|reader| reader.lines());
+    let player = ensure_reusable_vod_mpv().await?;
+    let ipc_path = player.ipc_path.clone();
+    let stderr = player.stderr_tx.subscribe();
     tokio::spawn(async move {
         let result = run_playlist(
-            &mut child,
             stderr,
             &ipc_path,
             api_client,
@@ -736,11 +946,9 @@ pub async fn play_playlist(
             session_id,
         )
         .await;
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        if !is_active_vod_session(session_id) {
+            return;
         }
-        let _ = tokio::fs::remove_file(&ipc_path).await;
         let event = match result {
             Ok(()) => PlaybackEvent::Finished {
                 session_id,
@@ -853,8 +1061,7 @@ fn write_playback_diagnostic(message: &str) {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_playlist(
-    child: &mut tokio::process::Child,
-    stderr: Option<tokio::io::Lines<BufReader<tokio::process::ChildStderr>>>,
+    mut stderr: broadcast::Receiver<String>,
     ipc_path: &std::path::Path,
     api_client: Arc<ApiClient>,
     items: Vec<PlaylistItem>,
@@ -863,17 +1070,21 @@ async fn run_playlist(
     tx: Sender<PlaybackEvent>,
     session_id: u64,
 ) -> Result<()> {
-    wait_for_ipc(ipc_path, child).await?;
+    ACTIVE_VOD_SESSION.store(session_id, Ordering::Release);
     let (end_tx, mut end_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let event_path = ipc_path.to_owned();
     let event_task =
         tokio::spawn(async move { observe_end_files(&event_path, end_tx, ready_tx).await });
-    timeout(Duration::from_secs(2), ready_rx)
-        .await
-        .map_err(|_| anyhow::anyhow!("MPV event observer timed out"))?
-        .map_err(|_| anyhow::anyhow!("MPV event observer failed to start"))?;
-    let mut stderr = stderr;
+    let observer_ready = match timeout(Duration::from_secs(2), ready_rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(anyhow::anyhow!("MPV event observer failed to start")),
+        Err(_) => Err(anyhow::anyhow!("MPV event observer timed out")),
+    };
+    if let Err(error) = observer_ready {
+        event_task.abort();
+        return Err(error);
+    }
     let mut decode_errors = VecDeque::new();
     let mut last_switch = Instant::now() - Duration::from_secs(10);
     let mut corrupted = false;
@@ -881,7 +1092,10 @@ async fn run_playlist(
     let mut item_started = Instant::now();
     let mut start_ts = chrono::Utc::now().timestamp();
     let mut played_any = false;
-    start_playlist_media(ipc_path, &items[index], &prepared).await?;
+    if let Err(error) = start_playlist_media(ipc_path, &items[index], &prepared).await {
+        event_task.abort();
+        return Err(error);
+    }
 
     // Materialize the remaining items in mpv's native playlist. Previously we
     // loaded each part with `replace` only after the preceding part ended,
@@ -927,46 +1141,28 @@ async fn run_playlist(
     );
 
     let result = loop {
+        if !is_active_vod_session(session_id) {
+            break Ok(());
+        }
         tokio::select! {
             _ = heartbeat.tick() => {
+                if !is_active_vod_session(session_id) {
+                    break Ok(());
+                }
                 report_playlist_heartbeat(&api_client, &items[index], &prepared, played_time, item_started, start_ts, 0).await;
             }
             _ = position.tick() => {
+                if !is_active_vod_session(session_id) {
+                    break Ok(());
+                }
                 if let Some(value) = mpv_time_pos(ipc_path).await { played_time = value.max(0.0) as i64; }
             }
-            status = child.wait() => {
-                report_playlist_heartbeat(
-                    &api_client,
-                    &items[index],
-                    &prepared,
-                    played_time,
-                    item_started,
-                    start_ts,
-                    4,
-                ).await;
-                if !corrupted && status.as_ref().is_ok_and(|status| status.success()) {
-                    prepared.proxy.record_success();
-                }
-                break match status {
-                    Ok(status) if status.success() => Ok(()),
-                    Ok(status) => Err(anyhow::anyhow!("MPV exited with {status}")),
-                    Err(error) => Err(error.into()),
-                };
-            }
             reason = end_rx.recv() => {
+                if !is_active_vod_session(session_id) {
+                    break Ok(());
+                }
                 let Some(reason) = reason else {
-                    // MPV closes every IPC client while shutting down. The event
-                    // socket can therefore reach EOF just before `child.wait()`
-                    // becomes ready; do not report that normal race as a playlist
-                    // failure.
-                    break match timeout(Duration::from_secs(2), child.wait()).await {
-                        Ok(Ok(status)) if status.success() => Ok(()),
-                        Ok(Ok(status)) => Err(anyhow::anyhow!("MPV exited with {status}")),
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(_) => Err(anyhow::anyhow!(
-                            "MPV IPC event stream closed while MPV was still running"
-                        )),
-                    };
+                    break Err(anyhow::anyhow!("MPV IPC event stream closed"));
                 };
                 if reason == "error" {
                     if !corrupted {
@@ -991,12 +1187,10 @@ async fn run_playlist(
                 let Some(next_index) = ((index + 1)..items.len())
                     .find(|candidate| queued_prepared[*candidate].is_some())
                 else {
-                    let _ = mpv_ipc(ipc_path, serde_json::json!(["quit"])).await;
-                    break match child.wait().await {
-                        Ok(status) if status.success() && played_any => Ok(()),
-                        Ok(status) if status.success() => Err(anyhow::anyhow!("播放列表所有项目均无法播放")),
-                        Ok(status) => Err(anyhow::anyhow!("MPV exited with {status}")),
-                        Err(error) => Err(error.into()),
+                    break if played_any {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("播放列表所有项目均无法播放"))
                     };
                 };
                 index = next_index;
@@ -1004,6 +1198,9 @@ async fn run_playlist(
                     .take()
                     .expect("playable playlist item disappeared");
                 set_playlist_item_context(ipc_path, &items[index], &prepared).await;
+                if let Err(error) = ensure_mpv_external_audio(ipc_path, &prepared.proxy.audio_url).await {
+                    break Err(error);
+                }
                 played_time = 0;
                 corrupted = false;
                 item_started = Instant::now();
@@ -1013,13 +1210,11 @@ async fn run_playlist(
                     &api_client, items[index].aid, prepared.cid, &items[index].bvid, prepared.duration,
                 ).await;
             }
-            line = async {
-                match &mut stderr {
-                    Some(lines) => lines.next_line().await,
-                    None => std::future::pending().await,
+            line = stderr.recv() => {
+                let Ok(line) = line else { continue };
+                if !is_active_vod_session(session_id) {
+                    break Ok(());
                 }
-            } => {
-                let Ok(Some(line)) = line else { stderr = None; continue };
                 if is_corrupt_video_log(&line) {
                     let now = Instant::now();
                     decode_errors.push_back(now);
